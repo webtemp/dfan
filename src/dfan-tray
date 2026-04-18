@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""dfan-tray — system tray icon showing dfan daemon status."""
+
+from __future__ import annotations
+
+import signal
+import subprocess
+import sys
+from pathlib import Path
+
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QAction, QColor, QIcon, QPainter, QPen, QPixmap
+from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
+
+STATE_FILE = Path("/run/dfan/state")
+REFRESH_MS = 2000
+ICON_PX = 64
+
+
+def read_state() -> dict[str, str] | None:
+    if not STATE_FILE.exists():
+        return None
+    state: dict[str, str] = {}
+    for raw in STATE_FILE.read_text().splitlines():
+        raw = raw.strip()
+        if not raw or "=" not in raw:
+            continue
+        k, v = raw.split("=", 1)
+        state[k.strip()] = v.strip().strip('"')
+    return state
+
+
+def temp_color(tc: float, lo: int, hi: int) -> QColor:
+    if tc < lo:
+        return QColor("#4caf50")  # green
+    if tc >= hi:
+        return QColor("#f44336")  # red
+    mid = lo + (hi - lo) * 2 / 3
+    if tc < mid:
+        return QColor("#ffeb3b")  # yellow
+    return QColor("#ff9800")  # orange
+
+
+def render_icon(pct: int, color: QColor) -> QIcon:
+    pix = QPixmap(ICON_PX, ICON_PX)
+    pix.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+    # Arc indicating fan %
+    p.setPen(QPen(color, 6))
+    span = -int(360 * min(pct, 100) / 100 * 16)
+    p.drawArc(4, 4, ICON_PX - 8, ICON_PX - 8, 90 * 16, span)
+
+    # Text in the middle
+    p.setPen(QColor("white"))
+    font = p.font()
+    font.setPointSize(20 if pct < 100 else 16)
+    font.setBold(True)
+    p.setFont(font)
+    p.drawText(pix.rect(), Qt.AlignmentFlag.AlignCenter, f"{pct}")
+
+    p.end()
+    return QIcon(pix)
+
+
+def format_tooltip(s: dict[str, str]) -> str:
+    label_w = 11  # column width for labels; perfect with monospace, decent otherwise
+    rows = [
+        ("🌡", "CPU temp",  f"{s.get('cpu_c', '?')}°C"),
+        ("⚙",  "Mode",      s.get("mode", "?")),
+        ("📈", "Curve",     s.get("curve", "?")),
+        ("🎯", "Range",     f"{s.get('fan_t_lo', '?')}–{s.get('fan_t_hi', '?')}°C"),
+        ("🌀", "Fan speed", f"{s.get('fan_pct', '?')}%  ({s.get('fan_pwm', '?')} PWM)"),
+    ]
+    lines = ["dFan", "───────────"]
+    lines += [f"{icon} {label + ':':<{label_w}} {value}" for icon, label, value in rows]
+    return "\n".join(lines)
+
+
+class DfanTray:
+    def __init__(self, app: QApplication):
+        self.app = app
+        self.tray = QSystemTrayIcon()
+        self.tray.setToolTip("dfan: loading…")
+        self.tray.setIcon(render_icon(0, QColor("#888")))
+
+        self.menu = QMenu()
+        for cmd, label in [
+            ("auto", "Auto mode"),
+            ("off", "Fans OFF"),
+            ("full", "Fans 100%"),
+        ]:
+            act = QAction(label, self.menu)
+            act.triggered.connect(lambda _, c=cmd: self._run(c))
+            self.menu.addAction(act)
+        self.menu.addSeparator()
+        for curve in ["linear", "quadratic", "cubic", "sqrt", "sigmoid"]:
+            act = QAction(f"Curve: {curve}", self.menu)
+            act.triggered.connect(lambda _, c=curve: self._run("curve", c))
+            self.menu.addAction(act)
+        self.menu.addSeparator()
+        quit_act = QAction("Quit tray", self.menu)
+        quit_act.triggered.connect(self.app.quit)
+        self.menu.addAction(quit_act)
+        self.tray.setContextMenu(self.menu)
+
+        self.tray.show()
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.refresh)
+        self.timer.start(REFRESH_MS)
+        self.refresh()
+
+    def _run(self, *args: str) -> None:
+        try:
+            subprocess.run(["dfanctl", *args], check=False, timeout=5)
+        except Exception as e:
+            print(f"dfanctl {' '.join(args)} failed: {e}", file=sys.stderr)
+
+    def refresh(self) -> None:
+        s = read_state()
+        if not s:
+            self.tray.setToolTip("dfan: not running")
+            self.tray.setIcon(render_icon(0, QColor("#888")))
+            return
+        try:
+            pct = int(s.get("fan_pct", "0"))
+            tc = float(s.get("cpu_c", "0"))
+            lo = int(s.get("fan_t_lo", "50"))
+            hi = int(s.get("fan_t_hi", "75"))
+        except ValueError:
+            pct, tc, lo, hi = 0, 0.0, 50, 75
+
+        mode = s.get("mode", "auto")
+        if mode == "off":
+            ring_color = QColor("#2196f3")  # blue
+        elif mode == "full":
+            ring_color = QColor("#f44336")  # red
+        else:
+            ring_color = temp_color(tc, lo, hi)
+
+        self.tray.setIcon(render_icon(pct, ring_color))
+        self.tray.setToolTip(format_tooltip(s))
+
+
+def main() -> int:
+    # Let Ctrl-C terminate the process cleanly instead of raising deep inside Qt.
+    # QTimer below wakes the event loop often enough for Python signal delivery.
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+    if not QSystemTrayIcon.isSystemTrayAvailable():
+        print("System tray not available on this desktop.", file=sys.stderr)
+        return 1
+    _tray = DfanTray(app)
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

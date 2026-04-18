@@ -1,0 +1,22 @@
+[Unit]
+Description=Simple CPU-temp-driven fan control loop (nct6687d)
+After=multi-user.target systemd-modules-load.service
+StartLimitBurst=0
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/dfan
+Restart=always
+RestartSec=10
+SyslogIdentifier=dfan
+
+# Run as root to write /sys
+User=root
+
+# Hardening (relaxed enough to allow /sys writes)
+ProtectSystem=no
+ProtectHome=read-only
+PrivateTmp=read-only
+
+[Install]
+WantedBy=multi-user.target

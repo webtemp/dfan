@@ -1,0 +1,7 @@
+.idea/
+.env
+.claude/
+.opencode/
+AGENTS.md
+CLAUDE.md
+temp/

@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+# dfanctl — live tuning for dfan daemon
+# Usage:
+#   dfanctl low  <°C>                 set FAN_T_LO (ramp start)
+#   dfanctl hi   <°C>                 set FAN_T_HI (full speed)
+#   dfanctl curve linear|quadratic|cubic|sqrt|sigmoid
+set -euo pipefail
+
+usage() {
+  local yellow='\033[1;33m' bold='\033[1m' reset='\033[0m'
+  echo -e "dfanctl — live tuning for the dfan fan controller daemon
+
+Usage:
+  dfanctl low   <°C>    Set ramp start temperature (FAN_T_LO)
+  dfanctl hi    <°C>    Set full-speed temperature  (FAN_T_HI)
+  dfanctl curve <shape> Set fan curve shape
+  dfanctl temp          Show current CPU temperature
+  dfanctl stats         Show all daemon stats (mode, curve, temp, PWM, …)
+  dfanctl off           Force all fans OFF (0 PWM)
+  dfanctl full          Force all fans to 100%
+  dfanctl auto          Return to normal temperature-driven mode
+
+Curve shapes:
+  linear      Straight ramp from low to hi
+  quadratic   Quiet at low temps, aggressive near hi
+  cubic       Even quieter at low, steeper climb near hi
+  sqrt        Spins up fast early, plateaus near hi
+  sigmoid     Smooth S-curve, gentle at both ends (default)
+
+Examples:
+  dfanctl low 50
+  dfanctl hi 75
+  dfanctl curve sigmoid
+  dfanctl full
+  dfanctl auto
+
+Changes to low/hi take effect immediately (signal-based).
+
+${yellow}Curve changes are picked up on the next daemon cycle — within 5 seconds at most.${reset}
+${bold}No restart required for any of the above.${reset}"
+
+}
+
+(($# >= 1)) || {
+  usage
+  exit 0
+}
+cmd=$1
+[[ "$cmd" == "--help" || "$cmd" == "-h" ]] && {
+  usage
+  exit 0
+}
+
+mkdir -p /run/dfan
+
+case "$cmd" in
+low)
+  (($# >= 2)) || {
+    echo "error: dfanctl low requires a temperature" >&2
+    exit 1
+  }
+  val=$2
+  [[ "$val" =~ ^[0-9]+$ ]] || {
+    echo "error: <temp> must be a positive integer" >&2
+    exit 1
+  }
+  echo "$val" >/run/dfan/low
+  systemctl kill --kill-whom=main -s SIGUSR1 dfan.service
+  ;;
+hi)
+  (($# >= 2)) || {
+    echo "error: dfanctl hi requires a temperature" >&2
+    exit 1
+  }
+  val=$2
+  [[ "$val" =~ ^[0-9]+$ ]] || {
+    echo "error: <temp> must be a positive integer" >&2
+    exit 1
+  }
+  echo "$val" >/run/dfan/hi
+  systemctl kill --kill-whom=main -s SIGUSR2 dfan.service
+  ;;
+curve)
+  (($# >= 2)) || {
+    echo "error: dfanctl curve requires a shape argument" >&2
+    echo >&2
+    usage >&2
+    exit 1
+  }
+  shape=$2
+  case "$shape" in
+  linear | quadratic | cubic | sqrt | sigmoid)
+    echo "$shape" >/run/dfan/curve
+    echo "curve set to '${shape}' — takes effect within ${INTERVAL:-5}s"
+    ;;
+  *)
+    echo "error: unknown curve '${shape}'" >&2
+    echo "       valid: linear  quadratic  cubic  sqrt  sigmoid" >&2
+    exit 1
+    ;;
+  esac
+  ;;
+temp)
+  sensor=""
+  for path in /sys/class/hwmon/hwmon*/name; do
+    [[ -r "$path" ]] || continue
+    read -r name <"$path"
+    [[ "$name" == "k10temp" ]] && {
+      sensor="${path%/name}/temp1_input"
+      break
+    }
+  done
+  [[ -n "$sensor" ]] || {
+    echo "error: k10temp sensor not found" >&2
+    exit 1
+  }
+  read -r t_mC <"$sensor"
+  echo "CPU temperature: $((t_mC / 1000)).$(((t_mC % 1000) / 100))°C"
+  ;;
+stats)
+  [[ -f /run/dfan/state ]] || {
+    echo "error: dfan is not running (no /run/dfan/state)" >&2
+    exit 1
+  }
+  # shellcheck disable=SC1091
+  source /run/dfan/state
+
+  bold='\033[1m' dim='\033[2m' reset='\033[0m'
+  green='\033[1;32m' yellow='\033[1;33m' red='\033[1;31m' cyan='\033[1;36m'
+
+  # Colour temp by range
+  tc=${cpu_c%.*}
+  if ((tc < fan_t_lo)); then
+    tcol=$green
+  elif ((tc < fan_t_hi - (fan_t_hi - fan_t_lo) / 3)); then
+    tcol=$cyan
+  elif ((tc < fan_t_hi)); then
+    tcol=$yellow
+  else
+    tcol=$red
+  fi
+
+  # Colour mode
+  case "$mode" in
+  auto) mcol=$green ;;
+  off) mcol=$cyan ;;
+  full) mcol=$red ;;
+  *) mcol=$yellow ;;
+  esac
+
+  age=$(($(date +%s) - updated))
+  stale=""
+  ((age > interval * 3)) && stale=" ${red}(stale: ${age}s ago)${reset}"
+
+  echo -e "  ${dim}CPU temp${reset}    : ${tcol}${cpu_c}°C${reset}"
+  echo -e "  ${dim}Mode${reset}        : ${mcol}${mode}${reset}"
+  echo -e "  ${dim}Curve${reset}       : ${bold}${curve}${reset}"
+  echo -e "  ${dim}Thresholds${reset}  : ${fan_t_lo}°C → ${fan_t_hi}°C"
+  echo -e "  ${dim}PWM range${reset}   : ${fan_pwm_min} → ${fan_pwm_max}"
+  echo -e "  ${dim}Fan speed${reset}   : ${bold}${fan_pct}%${reset}  (${fan_pwm} PWM)"
+  echo -e "  ${dim}Fan channels${reset}: ${fan_chans}"
+  echo -e "  ${dim}Hwmon${reset}       : cpu=${hwmon_cpu##*/}  chip=${hwmon_chip##*/}"
+  ;;
+off | full | auto)
+  echo "$cmd" >/run/dfan/mode
+  echo "mode set to '${cmd}' — takes effect within ${INTERVAL:-5}s"
+  ;;
+*)
+  echo "error: unknown command '${cmd}'" >&2
+  echo >&2
+  usage >&2
+  exit 1
+  ;;
+esac

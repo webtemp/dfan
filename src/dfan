@@ -1,0 +1,314 @@
+#!/usr/bin/env bash
+# dfan — CPU fan controller daemon
+# Reads k10temp, drives nct6687 PWM channels. Restores AUTO on exit.
+
+set -euo pipefail
+
+# ---- CONFIG ----
+FAN_CHANS=(1 3 4 5 6 7 8) # fan headers to control
+PUMP_CH=2                 # pump header
+
+FAN_T_LO=50      # °C: begin ramp
+FAN_T_HI=75      # °C: full speed
+FAN_PWM_MIN=0    # PWM at or below T_LO
+FAN_PWM_MAX=230  # PWM cap (~90%)
+FAN_MINSTART=100 # minimum kick PWM when spinning up from 0
+FAN_HYST=2       # °C dead-band to prevent flutter
+INTERVAL=5       # seconds between cycles
+FAN_CURVE=sqrt   # curve shape: linear | quadratic | cubic | sqrt | sigmoid
+FAN_MODE=auto    # operating mode: auto | off | full
+
+PUMP_PWM_BASE=125 # ~50% nominal
+PUMP_PWM_MAX=255  # full speed above PUMP_T_HI
+PUMP_T_HI=80      # °C threshold for pump max
+
+# -----------------
+
+find_hwmon() {
+  local name=$1 path found
+  for path in /sys/class/hwmon/hwmon*/name; do
+    [[ -r "$path" ]] || continue
+    read -r found <"$path"
+    [[ "$found" == "$name" ]] && {
+      printf '%s' "${path%/name}"
+      return 0
+    }
+  done
+  return 1
+}
+
+H_CPU=$(find_hwmon "k10temp") || {
+  echo "ERROR: k10temp sensor not found in /sys/class/hwmon" >&2
+  exit 1
+}
+H_CHIP=$(find_hwmon "nct6687") || {
+  echo "ERROR: nct6687 chip not found in /sys/class/hwmon" >&2
+  exit 1
+}
+
+have_pwm() { [[ -e "$H_CHIP/pwm$1" && -e "$H_CHIP/pwm${1}_enable" ]]; }
+
+enable_manual() {
+  for ch in "${FAN_CHANS[@]}"; do
+    have_pwm "$ch" && echo 1 >"$H_CHIP/pwm${ch}_enable" || true
+  done
+  have_pwm "$PUMP_CH" && echo 1 >"$H_CHIP/pwm${PUMP_CH}_enable" || true
+}
+
+restore_auto() {
+  echo "Shutting down — restoring AUTO mode on all channels"
+  for ch in "${FAN_CHANS[@]}"; do
+    [[ -e "$H_CHIP/pwm${ch}_enable" ]] && echo 2 >"$H_CHIP/pwm${ch}_enable" 2>/dev/null || true
+  done
+  [[ -e "$H_CHIP/pwm${PUMP_CH}_enable" ]] && echo 2 >"$H_CHIP/pwm${PUMP_CH}_enable" 2>/dev/null || true
+}
+trap restore_auto EXIT
+
+# SIGUSR1 → read /run/dfan/low → update FAN_T_LO live
+# SIGUSR2 → read /run/dfan/hi  → update FAN_T_HI live
+_sig_usr1() {
+  local val
+  read -r val </run/dfan/low 2>/dev/null || return
+  [[ "$val" =~ ^[0-9]+$ ]] || { echo "$(date +%H:%M:%S)  SIGUSR1 ignored — bad value in /run/dfan/low" >&2; return; }
+  (( val < FAN_T_HI )) || { echo "$(date +%H:%M:%S)  SIGUSR1 ignored — low (${val}°C) must be less than hi (${FAN_T_HI}°C)" >&2; return; }
+  FAN_T_LO=$val
+  echo "$(date +%H:%M:%S)  SIGUSR1 — FAN_T_LO → ${FAN_T_LO}°C (ramp now ${FAN_T_LO}–${FAN_T_HI}°C)"
+  for k in "${!LAST_WRITTEN_PWM[@]}"; do LAST_WRITTEN_PWM[$k]=256; done
+}
+_sig_usr2() {
+  local val
+  read -r val </run/dfan/hi 2>/dev/null || return
+  [[ "$val" =~ ^[0-9]+$ ]] || { echo "$(date +%H:%M:%S)  SIGUSR2 ignored — bad value in /run/dfan/hi" >&2; return; }
+  (( val > FAN_T_LO )) || { echo "$(date +%H:%M:%S)  SIGUSR2 ignored — hi (${val}°C) must be greater than low (${FAN_T_LO}°C)" >&2; return; }
+  FAN_T_HI=$val
+  echo "$(date +%H:%M:%S)  SIGUSR2 — FAN_T_HI → ${FAN_T_HI}°C (ramp now ${FAN_T_LO}–${FAN_T_HI}°C)"
+  for k in "${!LAST_WRITTEN_PWM[@]}"; do LAST_WRITTEN_PWM[$k]=256; done
+}
+trap '_sig_usr1' USR1
+trap '_sig_usr2' USR2
+
+# Sets _RESULT to v clamped to [lo, hi]. Runs in parent shell — no subshell.
+clamp() {
+  local v=$1 lo=$2 hi=$3
+  ((v < lo)) && v=$lo
+  ((v > hi)) && v=$hi
+  _RESULT=$v
+}
+
+# Sets _RESULT to integer square root of $1. Runs in parent shell — no subshell.
+isqrt() {
+  local n=$1
+  (( n <= 0 )) && { _RESULT=0; return; }
+  local x=$n x1
+  while true; do
+    x1=$(( (x + n / x) / 2 ))
+    (( x1 >= x )) && break
+    x=$x1
+  done
+  _RESULT=$x
+}
+
+declare -A LAST_PWM
+declare -A LAST_WRITTEN_PWM
+
+# Sets _RESULT to target PWM for fan channel $1 at temp $2 (°C).
+# Updates LAST_PWM[$1] for kick-start tracking. Runs in parent shell.
+map_fan_pwm() {
+  local ch="$1" tC="$2"
+  local lo="$FAN_T_LO" hi="$FAN_T_HI" pmin="$FAN_PWM_MIN" pmax="$FAN_PWM_MAX" kick="$FAN_MINSTART" hyst="$FAN_HYST"
+  local target
+  if ((tC <= lo - hyst)); then
+    target=$pmin
+  elif ((tC >= hi + hyst)); then
+    target=$pmax
+  else
+    local den=$((hi - lo)) t=$((tC - lo)) range=$((pmax - pmin))
+    ((den <= 0)) && den=1
+    case "$FAN_CURVE" in
+      linear)
+        target=$((pmin + t * range / den))
+        ;;
+      quadratic)
+        target=$((pmin + t * t * range / den / den))
+        ;;
+      cubic)
+        target=$((pmin + t * t * t * range / den / den / den))
+        ;;
+      sqrt)
+        # sqrt(t/den) scaled via sqrt(t*10000/den)/100
+        isqrt $(( t * 10000 / den ))
+        target=$(( pmin + range * _RESULT / 100 ))
+        ;;
+      sigmoid)
+        # smoothstep: 3t²-2t³ with t normalised to 0–100
+        local tn=$(( t * 100 / den ))
+        local smooth=$(( 3 * tn * tn - 2 * tn * tn * tn / 100 ))
+        target=$(( pmin + range * smooth / 10000 ))
+        ;;
+      *)
+        target=$((pmin + t * range / den))
+        ;;
+    esac
+  fi
+  clamp "$target" 0 255
+  target=$_RESULT
+  local last="${LAST_PWM[$ch]:-0}"
+  if ((last == 0 && target > 0 && target < kick)); then
+    target=$kick
+  fi
+  LAST_PWM[$ch]=$target
+  _RESULT=$target
+}
+
+# Sets _RESULT to target PWM for pump at temp $1 (°C). Runs in parent shell.
+map_pump_pwm() {
+  local tC="$1" base="$PUMP_PWM_BASE" max="$PUMP_PWM_MAX" thi="$PUMP_T_HI"
+  local target=$base
+  ((tC >= thi)) && target=$max
+  clamp "$target" 38 250
+}
+
+enable_manual
+mkdir -p /run/dfan
+
+# Cache valid channels once — sysfs paths don't change while driver is loaded
+VALID_FAN_CHANS=()
+for ch in "${FAN_CHANS[@]}"; do
+  have_pwm "$ch" && VALID_FAN_CHANS+=("$ch")
+done
+PUMP_VALID=0
+have_pwm "$PUMP_CH" && PUMP_VALID=1
+
+# ---- Startup banner ----
+echo "dfan starting"
+echo "  CPU sensor : $H_CPU (k10temp)"
+echo "  Fan chip   : $H_CHIP (nct6687)"
+echo "  Fan curve  : idle <${FAN_T_LO}°C, ramp ${FAN_T_LO}–${FAN_T_HI}°C, full >${FAN_T_HI}°C (hyst=${FAN_HYST}°C)"
+echo "  Curve shape: ${FAN_CURVE}  (linear|quadratic|cubic|sqrt|sigmoid)"
+echo "  PWM range  : ${FAN_PWM_MIN}–${FAN_PWM_MAX}, kick=${FAN_MINSTART}"
+echo "  Fan chans  : ${VALID_FAN_CHANS[*]}"
+if ((PUMP_VALID)); then
+  echo "  Pump chan  : $PUMP_CH (active) base=${PUMP_PWM_BASE} PWM, max at ${PUMP_T_HI}°C"
+else
+  echo "  Pump chan  : $PUMP_CH (NOT FOUND — skipping)"
+fi
+echo "  Interval   : ${INTERVAL}s, heartbeat every 60s"
+echo "  Live tune  : dfanctl low|hi <°C> / dfanctl curve <shape>"
+echo "dfan ready"
+# ------------------------
+
+last_log=0
+
+while :; do
+  # Pick up curve changes written by dfanctl (≤5s latency, no signal needed)
+  if [[ -f /run/dfan/curve ]]; then
+    local_curve=$(</run/dfan/curve)
+    case "$local_curve" in
+      linear|quadratic|cubic|sqrt|sigmoid)
+        if [[ "$local_curve" != "$FAN_CURVE" ]]; then
+          FAN_CURVE=$local_curve
+          echo "$(date +%H:%M:%S)  curve → ${FAN_CURVE}"
+          for k in "${!LAST_WRITTEN_PWM[@]}"; do LAST_WRITTEN_PWM[$k]=256; done
+        fi
+        ;;
+      *)
+        echo "$(date +%H:%M:%S)  WARNING: unknown curve '${local_curve}' in /run/dfan/curve" >&2
+        ;;
+    esac
+  fi
+
+  # Pick up mode changes written by dfanctl (≤5s latency, no signal needed)
+  if [[ -f /run/dfan/mode ]]; then
+    local_mode=$(</run/dfan/mode)
+    case "$local_mode" in
+      auto|off|full)
+        if [[ "$local_mode" != "$FAN_MODE" ]]; then
+          FAN_MODE=$local_mode
+          echo "$(date +%H:%M:%S)  mode → ${FAN_MODE}"
+          for k in "${!LAST_WRITTEN_PWM[@]}"; do LAST_WRITTEN_PWM[$k]=256; done
+        fi
+        ;;
+      *)
+        echo "$(date +%H:%M:%S)  WARNING: unknown mode '${local_mode}' in /run/dfan/mode" >&2
+        ;;
+    esac
+  fi
+
+  read -r t_mC <"$H_CPU/temp1_input" || {
+    echo "WARNING: failed to read CPU temp, skipping cycle" >&2
+    sleep "$INTERVAL"
+    continue
+  }
+
+  [[ -n "$t_mC" ]] || {
+    sleep "$INTERVAL"
+    continue
+  }
+
+  tC=$(((t_mC + 500) / 1000))
+
+  pwm_changed=0
+
+  # Fan channels
+  for ch in "${VALID_FAN_CHANS[@]}"; do
+    case "$FAN_MODE" in
+      off)   _RESULT=0 ;;
+      full)  _RESULT=$FAN_PWM_MAX ;;
+      *)     map_fan_pwm "$ch" "$tC" ;;
+    esac
+    if ((_RESULT != ${LAST_WRITTEN_PWM[$ch]:-256})); then
+      printf '%d' "$_RESULT" >"$H_CHIP/pwm$ch" 2>/dev/null || true
+      LAST_WRITTEN_PWM[$ch]=$_RESULT
+      pwm_changed=1
+    fi
+  done
+
+  # Pump
+  if ((PUMP_VALID)); then
+    map_pump_pwm "$tC"
+    if ((_RESULT != ${LAST_WRITTEN_PWM[$PUMP_CH]:-256})); then
+      printf '%d' "$_RESULT" >"$H_CHIP/pwm$PUMP_CH" 2>/dev/null || true
+      LAST_WRITTEN_PWM[$PUMP_CH]=$_RESULT
+    fi
+  fi
+
+  # Logging: one line on fan speed change, heartbeat every 60s at steady state
+  pct=$(( ${LAST_WRITTEN_PWM[${VALID_FAN_CHANS[0]}]:-0} * 100 / FAN_PWM_MAX ))
+  now=$(date +%s)
+
+  # Snapshot current state for dfanctl stats and tray tools. Atomic write.
+  # All values quoted so `source` in dfanctl is safe for space-containing strings.
+  {
+    echo "cpu_c=\"$(( t_mC / 1000 )).$(( (t_mC % 1000) / 100 ))\""
+    echo "mode=\"$FAN_MODE\""
+    echo "curve=\"$FAN_CURVE\""
+    echo "fan_t_lo=\"$FAN_T_LO\""
+    echo "fan_t_hi=\"$FAN_T_HI\""
+    echo "fan_pwm_min=\"$FAN_PWM_MIN\""
+    echo "fan_pwm_max=\"$FAN_PWM_MAX\""
+    echo "fan_pwm=\"${LAST_WRITTEN_PWM[${VALID_FAN_CHANS[0]}]:-0}\""
+    echo "fan_pct=\"$pct\""
+    echo "fan_chans=\"${VALID_FAN_CHANS[*]}\""
+    echo "hwmon_cpu=\"$H_CPU\""
+    echo "hwmon_chip=\"$H_CHIP\""
+    echo "interval=\"$INTERVAL\""
+    echo "updated=\"$now\""
+  } >/run/dfan/state.tmp && mv /run/dfan/state.tmp /run/dfan/state
+  if ((pwm_changed)); then
+    case "$FAN_MODE" in
+      off)  echo "$(date +%H:%M:%S)  mode=off — fans forced OFF" ;;
+      full) echo "$(date +%H:%M:%S)  mode=full — fans forced to 100%" ;;
+      *)    echo "$(date +%H:%M:%S)  CPU ${tC}°C → setting fans to ${pct}%" ;;
+    esac
+    last_log=$now
+  elif (( now - last_log >= 60 )); then
+    case "$FAN_MODE" in
+      off)  echo "$(date +%H:%M:%S)  CPU ${tC}°C — mode=off (fans OFF)" ;;
+      full) echo "$(date +%H:%M:%S)  CPU ${tC}°C — mode=full (fans 100%)" ;;
+      *)    echo "$(date +%H:%M:%S)  CPU ${tC}°C — fans steady at ${pct}%" ;;
+    esac
+    last_log=$now
+  fi
+
+  sleep "$INTERVAL"
+done
