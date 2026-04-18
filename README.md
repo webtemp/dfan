@@ -29,12 +29,13 @@ A lightweight CPU fan controller daemon for Linux. Reads temperature from the **
 ## Installation
 
 ```bash
-git clone <repo> dfan
+git clone https://github.com/webtemp/dfan.git dfan
 cd dfan
 sudo ./install.sh
 ```
 
 The installer will:
+
 1. Symlink `src/dfan` and `src/dfanctl` into `/usr/local/sbin/`
 2. Install and enable the systemd service
 3. Create `/run/dfan/` (world-writable tmpfs dir) via `tmpfiles.d`
@@ -69,27 +70,6 @@ dfan/
 ├── uninstall.sh
 └── README.md
 ```
-
-## System tray (optional)
-
-A PyQt6 tray icon is installed alongside the daemon. It shows current
-fan % inside a colour-coded ring (green/yellow/orange/red by CPU temp,
-blue when forced off, red when forced full) and a tooltip with full
-stats. Right-click menu lets you switch mode or curve without opening
-a terminal.
-
-```bash
-sudo pacman -S python-pyqt6                       # or your distro's equivalent
-systemctl --user start dfan-tray                  # run now
-systemctl --user enable dfan-tray                 # auto-start on login (default)
-systemctl --user status dfan-tray                 # check it
-journalctl --user -u dfan-tray -f                 # tail logs
-```
-
-The tray runs as a **user** systemd service, not system-wide — logs are
-per-user and it starts when your graphical session does.
-
----
 
 ## Usage
 
@@ -205,6 +185,27 @@ These can also be changed at runtime with `dfanctl` without editing the file.
 3. It only writes to sysfs when the target PWM actually changes (hysteresis prevents thrashing)
 4. `SIGUSR1` / `SIGUSR2` update `FAN_T_LO` / `FAN_T_HI` live; curve and mode changes are picked up by polling `/run/dfan/`
 5. On exit (shutdown, SIGTERM, Ctrl-C), all fan channels are restored to hardware AUTO mode
+
+---
+
+## System tray (optional)
+
+A PyQt6 tray icon is installed alongside the daemon. It shows current
+fan % inside a colour-coded ring (green/yellow/orange/red by CPU temp,
+blue when forced off, red when forced full) and a tooltip with full
+stats. Right-click menu lets you switch mode or curve without opening
+a terminal.
+
+```bash
+sudo pacman -S python-pyqt6                       # or your distro's equivalent
+systemctl --user start dfan-tray                  # run now
+systemctl --user enable dfan-tray                 # auto-start on login (default)
+systemctl --user status dfan-tray                 # check it
+journalctl --user -u dfan-tray -f                 # tail logs
+```
+
+The tray runs as a **user** systemd service, not system-wide — logs are
+per-user and it starts when your graphical session does.
 
 ---
 
